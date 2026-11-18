@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "author": "Smart Anti-Theft Locker Alarm (ECP421)",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnVib",
+      "top": 63.8,
+      "left": -192,
+      "attrs": { "color": "yellow", "label": "VIBRATION (SW-420)", "key": "v" }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "swTilt",
+      "top": 177.2,
+      "left": -160,
+      "attrs": { "value": "" }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "txtTilt",
+      "top": 230,
+      "left": -220,
+      "attrs": { "text": "TILT (SW-520D)\nleft = level, right = tilted" }
+    },
+
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btnBoot",
+      "top": 217.4,
+      "left": 172.8,
+      "attrs": { "color": "blue", "label": "BOOT (arm / disarm)", "key": "b" }
+    },
+
+    {
+      "type": "wokwi-resistor",
+      "id": "rGreen",
+      "top": 90,
+      "left": 150,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledGreen",
+      "top": 25,
+      "left": 250,
+      "attrs": { "color": "green", "label": "ARMED" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "rRed",
+      "top": 70,
+      "left": 150,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledRed",
+      "top": 25,
+      "left": 310,
+      "attrs": { "color": "red", "label": "ALARM" }
+    },
+
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz",
+      "top": 110,
+      "left": 300,
+      "attrs": { "volume": "0.2" }
+    },
+
+    {
+      "type": "wokwi-text",
+      "id": "title",
+      "top": -60,
+      "left": -40,
+      "attrs": { "text": "Smart Anti-Theft Locker Alarm - ESP32 + ThingSpeak" }
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+
+    [ "btnVib:1.r", "esp:3V3", "red", [] ],
+    [ "btnVib:2.r", "esp:27", "gold", [] ],
+
+    [ "swTilt:1", "esp:GND.1", "black", [] ],
+    [ "swTilt:2", "esp:26", "blue", [] ],
+    [ "swTilt:3", "esp:3V3", "red", [] ],
+
+    [ "btnBoot:1.l", "esp:0", "cyan", [] ],
+    [ "btnBoot:2.l", "esp:GND.3", "black", [] ],
+
+    [ "esp:19", "rGreen:1", "green", [] ],
+    [ "rGreen:2", "ledGreen:A", "green", [] ],
+    [ "ledGreen:C", "esp:GND.2", "black", [] ],
+
+    [ "esp:21", "rRed:1", "orange", [] ],
+    [ "rRed:2", "ledRed:A", "orange", [] ],
+    [ "ledRed:C", "esp:GND.2", "black", [] ],
+
+    [ "esp:18", "bz:2", "purple", [] ],
+    [ "bz:1", "esp:GND.3", "black", [] ]
+  ],
+  "dependencies": {}
+}
