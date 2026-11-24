@@ -226,7 +226,9 @@ The Arduino IDE setup (ESP32 board package, driver, upload steps) is unchanged; 
 The dashboard is three static files in [`dashboard/`](dashboard): `index.html`, `style.css` and `app.js`. It needs no server, no build step and no installation.
 
 ### 5.1 Open it
-Choose one:
+The dashboard is already published at **https://mohitanuragi.github.io/smart-locker-dashboard/** (demo: add `?demo`). Open that link on any phone or computer and go to 5.2.
+
+To run your own copy instead, choose one:
 - **On a laptop:** double-click `dashboard/index.html`. It opens in the browser and works straight away.
 - **On any phone or computer (recommended for the demo):** publish the repository with **GitHub Pages** (repository **Settings → Pages → Deploy from a branch → main / root**). The dashboard is then at `https://<user>.github.io/Anti-Theft-Locker-System/dashboard/`. The files contain no keys (A18), so publishing them is safe.
 - **To try it without hardware or ThingSpeak:** open `dashboard/index.html?demo`. This simulated locker follows the firmware's rules; the PIN is `1234`. Demo controls let you knock, tilt, press BOOT and drop the Wi-Fi.

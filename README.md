@@ -10,6 +10,9 @@ A buzzer and LEDs give a local alarm, and the ESP32 reports to ThingSpeak over H
 - an **email alert** to the owner (2023kuec2054@iiitkota.ac.in) through the ThingSpeak Alerts API;
 - a FreeRTOS network task on the ESP32's second core, so cloud requests never pause the alarm.
 
+**Live dashboard:** https://mohitanuragi.github.io/smart-locker-dashboard/
+(try it without hardware: https://mohitanuragi.github.io/smart-locker-dashboard/?demo, PIN 1234)
+
 Start with **[`SETUP.md`](SETUP.md)**. It lists the assumptions and the complete ThingSpeak, firmware and dashboard setup.
 
 | Folder / file | Contents |

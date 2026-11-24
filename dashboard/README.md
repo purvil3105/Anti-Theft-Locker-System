@@ -1,5 +1,7 @@
 # Owner web dashboard
 
+**Live:** https://mohitanuragi.github.io/smart-locker-dashboard/ · **Demo:** https://mohitanuragi.github.io/smart-locker-dashboard/?demo (PIN 1234)
+
 A static web page (no server, no build, no install) for the Smart Anti-Theft Locker Alarm:
 
 - **4-digit PIN login**, with the keypad locked after 5 wrong tries and automatic lock after 10 minutes idle;
