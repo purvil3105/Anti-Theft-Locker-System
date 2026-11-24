@@ -1,10 +1,14 @@
-/* Smart Anti-Theft Locker Alarm - owner web dashboard
+/* Smart Anti-Theft Locker Alarm - owner web dashboard (MQTT version)
  *
- * - Reads the ThingSpeak channel (fields 1-8 + status) every 5 s.
- * - Sends "ARM <pin>" / "DISARM <pin>" through ThingSpeak TalkBack; the ESP32 checks the PIN.
+ * - Connects to the MQTT broker (EMQX Cloud) over secure WebSockets and listens to the locker live:
+ *     locker/state  retained JSON from the ESP32 (the single source of truth: BOOT button and
+ *                   dashboard both change it, so both always agree)
+ *     locker/status retained "online" / "offline" (last will of the ESP32)
+ *     locker/ack    result of each command
+ * - Sends "ARM <pin>" / "DISARM <pin>" to locker/cmd; the ESP32 checks the PIN.
  * - Raises an alert (banner, sound, browser notification) when the locker reports
  *   TAMPER (2) or THEFT (3). The email alert itself is sent by the ESP32.
- * - Open index.html?demo for a simulated locker (no ThingSpeak needed, PIN 1234).
+ * - Open index.html?demo for a simulated locker (no broker needed, PIN 1234).
  */
 (() => {
   'use strict';
@@ -14,14 +18,14 @@
   const DEMO = params.has('demo');
   const KEY = DEMO ? 'smartlocker.demo.' : 'smartlocker.';
 
-  const POLL_MS = DEMO ? 1500 : 5000;          // channel read interval
-  const OFFLINE_MS = DEMO ? 15000 : 60000;     // no new entry for this long = locker offline
+  const POLL_MS = 1500;                        // demo only: simulator read interval
+  const OFFLINE_MS = DEMO ? 15000 : 90000;     // no update for this long = locker offline (it reports every 30 s)
   const IDLE_LOGOUT_MS = 10 * 60 * 1000;       // lock the dashboard after 10 min without activity
   const MAX_TRIES = 5;                         // wrong PINs before the keypad locks
   const LOCKOUT_MS = 60 * 1000;                // first lockout; grows with each round
-  const CMD_SLOW_MS = 45 * 1000;
-  const CMD_GIVEUP_MS = 150 * 1000;            // locker ignores commands older than 120 s
-  const RESULTS = 120;                         // about 40 min of history at one entry per 20 s
+  const CMD_SLOW_MS = DEMO ? 45 * 1000 : 4 * 1000;
+  const CMD_GIVEUP_MS = DEMO ? 150 * 1000 : 10 * 1000;
+  const RESULTS = 120;                         // updates kept for the timeline
 
   const STATES = [
     { name: 'Disarmed', short: 'Disarmed', desc: 'The alarm is off. Arm it before you leave the locker.' },
@@ -34,8 +38,7 @@
     2: ['Locker disarmed.', 'ok'],
     3: ['The locker rejected the PIN. The dashboard PIN must match OWNER_PIN in the firmware.', 'bad'],
     4: ['The locker refused the command: too many wrong PINs. It accepts commands again after 5 minutes.', 'bad'],
-    5: ['The command reached the locker more than 2 minutes late and was ignored. Try again.', 'bad'],
-    6: ['The locker did not understand the command.', 'bad'],
+    5: ['The locker did not understand the command.', 'bad'],
   };
   const MAIL_TEXT = {
     0: ['None', ''], 1: ['Sending', 'warn'], 2: ['Sent', 'ok'], 3: ['Retrying', 'warn'], 4: ['Not set up', 'bad'],
@@ -160,35 +163,40 @@
   }
 
   // ---------------------------------------------------------------- data sources
-  function thingSpeak(s) {
-    const base = 'https://api.thingspeak.com';
-    const tb = `${base}/talkbacks/${encodeURIComponent(s.tbId)}/commands`;
+  const T = { state: 'locker/state', cmd: 'locker/cmd', ack: 'locker/ack', status: 'locker/status' };
+  const mqttUrl = (s) => `wss://${s.host}:${s.port}/mqtt`;
+  const clientId = () => 'locker-web-' + Math.random().toString(16).slice(2, 10);
+  function mqttSource(s) {
+    let client = null;
     return {
-      label: `ThingSpeak channel ${s.channelId}`,
-      async feeds() {
-        const q = new URLSearchParams({ results: RESULTS, status: 'true' });
-        if (s.readKey) q.set('api_key', s.readKey);
-        const r = await fetch(`${base}/channels/${encodeURIComponent(s.channelId)}/feeds.json?${q}`, { cache: 'no-store' });
-        if (!r.ok) throw new Error(r.status === 404 ? 'channel not found' : `ThingSpeak error ${r.status}`);
-        const j = await r.json();
-        if (!j || !Array.isArray(j.feeds)) throw new Error('no access to the channel (check the Channel ID and Read API key)');
-        return j.feeds;
-      },
-      async checkTalkBack() {
-        const r = await fetch(`${tb}.json?api_key=${encodeURIComponent(s.tbKey)}`, { cache: 'no-store' });
-        if (!r.ok) throw new Error(r.status === 401 ? 'TalkBack refused the API key' : `TalkBack error ${r.status}`);
-      },
-      async command(text) {
-        // Only the newest command should run, so clear anything still queued (best effort).
-        try { await fetch(`${tb}.json?api_key=${encodeURIComponent(s.tbKey)}`, { method: 'DELETE' }); } catch { /* ignore */ }
-        const r = await fetch(`${tb}.json`, {
-          method: 'POST',
-          body: new URLSearchParams({ api_key: s.tbKey, command_string: text }),
+      label: `MQTT broker ${s.host}`,
+      start(h) {
+        if (typeof mqtt === 'undefined') { h.onLink(false, 'the MQTT library did not load (check your internet connection)'); return; }
+        client = mqtt.connect(mqttUrl(s), {
+          username: s.user, password: s.pass, clientId: clientId(),
+          clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 8000,
         });
-        if (!r.ok) throw new Error(r.status === 401 ? 'TalkBack refused the API key' : `TalkBack error ${r.status}`);
-        const j = await r.json();
-        if (!j || j.id == null) throw new Error('TalkBack did not return a command id');
-        return String(j.id);
+        client.on('connect', () => {
+          h.onLink(true);
+          client.subscribe([T.state, T.status, T.ack], { qos: 1 });
+        });
+        client.on('reconnect', () => h.onLink(false, 'reconnecting…'));
+        client.on('offline', () => h.onLink(false, 'offline'));
+        client.on('error', (e) => h.onLink(false, (e && e.message) || 'connection error'));
+        client.on('message', (topic, payload) => {
+          const text = payload.toString();
+          if (topic === T.status) { h.onStatus(text); return; }
+          let j;
+          try { j = JSON.parse(text); } catch { return; }
+          if (topic === T.state) h.onState(j); else if (topic === T.ack) h.onAck(j);
+        });
+      },
+      stop() { if (client) { try { client.end(true); } catch { /* ignore */ } client = null; } },
+      command(text) {
+        return new Promise((resolve, reject) => {
+          if (!client || !client.connected) { reject(new Error('not connected to the MQTT broker')); return; }
+          client.publish(T.cmd, text, { qos: 1, retain: false }, (err) => (err ? reject(err) : resolve('')));
+        });
       },
     };
   }
@@ -225,7 +233,7 @@
     function run(c) {
       const [verb, pin] = c.text.trim().toUpperCase().split(/[\s:]+/);
       s.cmdId = c.id;
-      if (verb !== 'ARM' && verb !== 'DISARM') { s.cmd = 6; setStatus('Unknown command from dashboard'); return; }
+      if (verb !== 'ARM' && verb !== 'DISARM') { s.cmd = 5; setStatus('Unknown command from dashboard'); return; }
       if (pin !== '1234') { wrong += 1; s.cmd = 3; setStatus(`Wrong PIN from dashboard (${wrong} of 5 tries)`); return; }
       wrong = 0;
       if (verb === 'ARM') { s.cmd = 1; armNow('dashboard'); return; }
@@ -367,6 +375,7 @@
   // ---------------------------------------------------------------- app state
   let settings = null, source = null, sim = null;
   let entries = [], running = false, pollTimer = null, lastError = null, busy = false, pending = null;
+  let seq = 0, linkUp = false, dev = { online: null };   // live (MQTT) mode: entry counter, broker link, locker status
   let loginPad, modalPad, modalVerb = null;
 
   function show(view) { ['setupView', 'loginView', 'dashView'].forEach((v) => { $(v).hidden = v !== view; }); }
@@ -374,16 +383,16 @@
   const startSession = () => session.set({ exp: Date.now() + IDLE_LOGOUT_MS });
 
   // ---------------------------------------------------------------- setup / settings
-  const settingsComplete = (s) => !!s && (s.demo || (s.channelId && s.tbId && s.tbKey)) && s.pinHash && s.salt;
+  const settingsComplete = (s) => !!s && (s.demo || (s.host && s.port && s.user && s.pass)) && s.pinHash && s.salt;
 
   function openSetup(first) {
     show('setupView');
     const f = $('setupForm'), s = settings || {};
-    f.channelId.value = s.channelId || '';
-    f.readKey.value = s.readKey || '';
-    f.tbId.value = s.tbId || '';
-    f.tbKey.value = s.tbKey || '';
-    f.pin1.value = ''; f.pin2.value = '';
+    f.elements.brokerHost.value = s.host || '';
+    f.elements.brokerPort.value = s.port || '8084';
+    f.elements.mqttUser.value = s.user || '';
+    f.elements.mqttPass.value = s.pass || '';
+    f.elements.pin1.value = ''; f.elements.pin2.value = '';
     $('setupTitle').textContent = first ? 'Set up the dashboard' : 'Settings';
     $('pinLegend').textContent = first ? 'Owner PIN' : 'Change PIN (leave empty to keep it)';
     $('setupBack').hidden = first;
@@ -394,36 +403,49 @@
   function formValues() {
     const f = $('setupForm');
     return {
-      channelId: f.channelId.value.trim(), readKey: f.readKey.value.trim(),
-      tbId: f.tbId.value.trim(), tbKey: f.tbKey.value.trim(), pin1: f.pin1.value.trim(), pin2: f.pin2.value.trim(),
+      host: f.elements.brokerHost.value.trim().replace(/^[a-z]+:\/\//i, '').replace(/[/:].*$/, ''),
+      port: f.elements.brokerPort.value.trim(), user: f.elements.mqttUser.value.trim(), pass: f.elements.mqttPass.value,
+      pin1: f.elements.pin1.value.trim(), pin2: f.elements.pin2.value.trim(),
     };
   }
   function validate(v, needPin) {
-    if (!/^\d+$/.test(v.channelId)) return 'The Channel ID is a number (ThingSpeak > Channel > Channel ID).';
-    if (!/^\d+$/.test(v.tbId)) return 'The TalkBack ID is a number (Apps > TalkBack).';
-    if (!v.tbKey) return 'Enter the TalkBack API key.';
+    if (!/^[a-z0-9.-]+$/i.test(v.host)) return 'Enter the broker address from the EMQX Deployment Overview (no wss:// and no port).';
+    if (!/^\d{2,5}$/.test(v.port)) return 'The WebSocket TLS port is a number (8084 on EMQX Cloud Serverless).';
+    if (!v.user) return 'Enter the web username (Access Control > Authentication).';
+    if (!v.pass) return 'Enter the web password.';
     if (needPin || v.pin1 || v.pin2) {
       if (!/^\d{4}$/.test(v.pin1)) return 'The PIN must be exactly 4 digits.';
       if (v.pin1 !== v.pin2) return 'The two PINs do not match.';
     }
     return null;
   }
-  async function testConnection() {
+  function testConnection() {
     const v = formValues();
     const msg = $('setupMsg');
     const err = validate(v, false);
     if (err) return setMsg(msg, err, 'bad');
+    if (typeof mqtt === 'undefined') return setMsg(msg, 'The MQTT library did not load. Check your internet connection and reload the page.', 'bad');
     setMsg(msg, 'Testing…', 'wait');
-    const ts = thingSpeak(v);
-    try {
-      const feeds = await ts.feeds();
-      const last = feeds.length ? norm(feeds[feeds.length - 1]) : null;
-      let text = last ? `Channel OK, last update ${ago(Date.now() - last.t)}.` : 'Channel OK, but it has no entries yet (power on the locker).';
-      try { await ts.checkTalkBack(); text += ' TalkBack OK.'; setMsg(msg, text, 'ok'); }
-      catch (e) { setMsg(msg, `${text} TalkBack failed: ${e.message}.`, 'bad'); }
-    } catch (e) {
-      setMsg(msg, `Channel failed: ${e.message}.`, 'bad');
-    }
+    let c = null, done = false, status = null, timer = null;
+    const finish = (text, kind) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { c.end(true); } catch { /* ignore */ }
+      setMsg(msg, text, kind);
+    };
+    timer = setTimeout(() => finish('Timed out: could not reach the broker. Check the address and the port.', 'bad'), 10000);
+    c = mqtt.connect(mqttUrl(v), { username: v.user, password: v.pass, clientId: clientId(), reconnectPeriod: 0, connectTimeout: 8000 });
+    c.on('error', (e) => finish(`The broker refused the connection: ${(e && e.message) || 'unknown error'}.`, 'bad'));
+    c.on('message', (topic, payload) => { if (topic === T.status) status = payload.toString(); });
+    c.on('connect', () => {
+      c.subscribe([T.status]);
+      setTimeout(() => {
+        if (status === 'online') finish('Broker OK. The locker is online.', 'ok');
+        else if (status === 'offline') finish('Broker OK, but the locker is offline. Power it on and check its Serial Monitor.', 'wait');
+        else finish('Broker OK. The locker has not connected yet.', 'wait');
+      }, 2000);
+    });
   }
   function saveSetup(ev) {
     ev.preventDefault();
@@ -431,7 +453,7 @@
     const v = formValues();
     const err = validate(v, first);
     if (err) return setMsg($('setupMsg'), err, 'bad');
-    const next = { channelId: v.channelId, readKey: v.readKey, tbId: v.tbId, tbKey: v.tbKey,
+    const next = { host: v.host, port: v.port, user: v.user, pass: v.pass,
       salt: settings && settings.salt, pinHash: settings && settings.pinHash };
     if (v.pin1) { next.salt = newSalt(); next.pinHash = hashPin(next.salt, v.pin1); passPin(); }
     settings = next;
@@ -478,24 +500,31 @@
   // ---------------------------------------------------------------- dashboard
   function enterDash() {
     show('dashView');
-    source = DEMO ? sim : thingSpeak(settings);
+    source = DEMO ? sim : mqttSource(settings);
     $('footSource').textContent = source.label;
     $('demoPanel').hidden = !DEMO;
     $('settingsBtn').hidden = DEMO;
     updateNotifyBtn();
-    if (!running) { running = true; poll(); }
+    if (running) return;
+    running = true;
+    if (DEMO) { poll(); return; }
+    loadHistory();
+    renderPill();
+    if (entries.length) renderAll();
+    source.start({ onLink, onState, onStatus, onAck });
   }
   function stopDash() {
     running = false;
     clearTimeout(pollTimer);
+    if (source && source.stop) source.stop();
     stopSiren();
     closeModal();
-    entries = []; pending = null; lastError = null;
+    entries = []; pending = null; lastError = null; linkUp = false; dev = { online: null };
     document.title = 'Smart Locker Dashboard';
     $('alertBanner').hidden = true;
     setMsg($('cmdMsg'), '', '');
   }
-  async function poll() {
+  async function poll() {                      // demo only: the simulator is read like a channel
     if (!running) return;
     try {
       const feeds = await source.feeds();
@@ -511,14 +540,70 @@
     }
   }
 
+  // ---- live updates from the broker
+  function loadHistory() {
+    const h = store.get('hist', []);
+    entries = Array.isArray(h) ? h.map((e) => ({ ...e, t: new Date(e.t) })).filter((e) => !Number.isNaN(e.t.getTime())) : [];
+    seq = entries.reduce((m, e) => Math.max(m, e.id || 0), 0);
+  }
+  const saveHistory = () => store.set('hist', entries.map((e) => ({ ...e, t: e.t.getTime() })));
+  function onLink(up, err) {
+    if (!running) return;
+    linkUp = up;
+    lastError = up ? null : (err || null);
+    renderAll();
+  }
+  function onStatus(text) {
+    if (!running) return;
+    dev.online = text === 'online';
+    renderAll();
+  }
+  function onState(j) {
+    if (!running || !j || typeof j.state !== 'number') return;
+    const prev = entries[entries.length - 1];
+    const total = Number(j.vib) || 0;
+    entries.push({
+      id: ++seq, t: new Date(), state: j.state, armed: j.armed, tilt: j.tilt,
+      vib: prev && prev.vibTotal != null && total >= prev.vibTotal ? total - prev.vibTotal : 0,   // new vibrations in this update
+      vibTotal: total, alarms: j.alarms, mail: j.mail, status: String(j.msg || '').trim(),
+      cmd: null, cmdId: '', exitLeft: j.exitLeft == null ? null : Number(j.exitLeft),
+    });
+    if (entries.length > RESULTS) entries.splice(0, entries.length - RESULTS);
+    saveHistory();
+    renderAll();
+  }
+  function onAck(j) {
+    if (!running || !pending) return;
+    const [text, kind] = CMD_TEXT[j.code] || [`The locker replied with code ${j.code}.`, 'bad'];
+    setMsg($('cmdMsg'), text, kind);
+    pending = null;
+    renderAll();
+  }
+
+  const isOnline = (last) => {
+    if (!last) return false;
+    const fresh = Date.now() - last.t < OFFLINE_MS;
+    return DEMO ? fresh : linkUp && dev.online !== false && fresh;
+  };
   function renderPill() {
     const pill = $('linkPill'), text = pill.querySelector('span');
     const last = entries[entries.length - 1];
-    if (lastError) { pill.className = 'pill error'; text.textContent = `Cannot reach ThingSpeak: ${lastError}`; return; }
-    if (!last) { pill.className = 'pill'; text.textContent = 'Waiting for the first update'; return; }
+    if (lastError) { pill.className = 'pill error'; text.textContent = `Cannot reach the MQTT broker: ${lastError}`; return; }
+    if (!DEMO && !linkUp) { pill.className = 'pill'; text.textContent = 'Connecting to the MQTT broker…'; return; }
+    if (!last) { pill.className = 'pill'; text.textContent = DEMO ? 'Waiting for the first update' : 'Waiting for the locker'; return; }
     const age = Date.now() - last.t;
-    if (age < OFFLINE_MS) { pill.className = 'pill online'; text.textContent = `Locker online · updated ${ago(age)}`; }
+    if (isOnline(last)) { pill.className = 'pill online'; text.textContent = `Locker online · updated ${ago(age)}`; }
     else { pill.className = 'pill offline'; text.textContent = `Locker offline · last seen ${ago(age)}`; }
+  }
+  function descFor(last, online) {
+    const st = Math.min(3, Math.max(0, last.state | 0));
+    let d = STATES[st].desc;
+    if (st === 0 && last.armed === 1) {
+      const left = last.exitLeft == null ? null : Math.max(0, Math.ceil(last.exitLeft - (Date.now() - last.t) / 1000));
+      d = left == null ? 'Exit delay: close the locker. It is armed 10 s after the command.'
+        : left > 0 ? `Exit delay: close the locker. Armed in ${left} s.` : 'Exit delay finished. Arming now…';
+    }
+    return d + (online ? '' : ' This is the last known state: the locker has stopped reporting.');
   }
 
   function renderAll() {
@@ -527,29 +612,31 @@
     const card = $('stateCard');
     if (!last) {
       card.dataset.state = 'none';
-      $('stateName').textContent = 'No data yet';
-      $('stateDesc').textContent = 'The channel has no entries. Power on the locker and wait about 20 s.';
+      $('stateName').textContent = DEMO ? 'No data yet' : 'Waiting for the locker';
+      $('stateDesc').textContent = 'Power on the locker. Its state appears here the moment it connects.';
       $('armBtn').disabled = $('disarmBtn').disabled = true;
       return;
     }
-    const online = Date.now() - last.t < OFFLINE_MS;
+    const online = isOnline(last);
     const st = Math.min(3, Math.max(0, last.state | 0));
     const arming = st === 0 && last.armed === 1;
     card.dataset.state = arming ? 'arming' : String(st);
     $('stateName').textContent = arming ? 'Arming…' : STATES[st].name;
-    $('stateDesc').textContent = (arming ? 'Exit delay: close the locker. It is armed 10 s after the command.' : STATES[st].desc) +
-      (online ? '' : ' This is the last known state: the locker has stopped reporting.');
-    $('armBtn').disabled = busy || last.armed === 1;
-    $('disarmBtn').disabled = busy || last.armed !== 1;
+    $('stateDesc').textContent = descFor(last, online);
+    const canSend = DEMO || online;                 // a command to an offline locker would be lost
+    $('armBtn').disabled = busy || !canSend || last.armed === 1;
+    $('disarmBtn').disabled = busy || !canSend || last.armed !== 1;
     $('armBtn').className = 'btn big' + (last.armed === 1 ? '' : ' primary');
     $('disarmBtn').className = 'btn big' + (last.armed === 1 ? ' primary' : '');
 
+    // tiles
     // tiles
     const tilt = $('tTilt');
     tilt.textContent = last.tilt ? 'Tilted' : 'Level';
     tilt.className = last.tilt ? 'bad' : 'ok';
     $('tTiltSub').textContent = last.tilt ? 'locker moved or lifted' : 'locker in place';
-    $('tVib').textContent = last.vib == null ? '–' : String(last.vib);
+    const vibNow = last.vibTotal != null ? last.vibTotal : last.vib;
+    $('tVib').textContent = vibNow == null ? '–' : String(vibNow);
     $('tAlarms').textContent = last.alarms == null ? '–' : String(last.alarms);
     const [mailText, mailCls] = MAIL_TEXT[last.mail] || ['–', ''];
     $('tMail').textContent = mailText;
@@ -645,7 +732,7 @@
         const frag = document.createDocumentFragment();
         frag.append(tag, document.createTextNode(e.state >= 3
           ? (prev && prev.state === 2 ? ' · escalated: locker lifted or tilted' : ' · locker lifted or tilted')
-          : ` · forcing detected (${e.vib || 0} vibrations)`));
+          : ' · forcing detected (repeated vibration)'));
         alarms.push(listItem(e.t, frag));
       } else if (prev && prev.state >= 2 && e.state < 2) {
         alarms.push(listItem(e.t, document.createTextNode('Alarm cleared · system disarmed')));
@@ -667,21 +754,24 @@
   function checkPending() {
     if (!pending) return;
     const msg = $('cmdMsg');
-    const hit = entries.find((e) => e.cmdId === pending.id);
-    if (hit) {
-      const [text, kind] = CMD_TEXT[hit.cmd] || [`The locker replied with code ${hit.cmd}.`, 'bad'];
-      setMsg(msg, text, kind);
-      pending = null;
-      return;
+    if (DEMO && pending.id) {                                   // the simulator confirms through its entries
+      const hit = entries.find((e) => e.cmdId === pending.id);
+      if (hit) {
+        const [text, kind] = CMD_TEXT[hit.cmd] || [`The locker replied with code ${hit.cmd}.`, 'bad'];
+        setMsg(msg, text, kind);
+        pending = null;
+        return;
+      }
     }
     const waited = Date.now() - pending.at, secs = Math.round(waited / 1000);
     if (waited > CMD_GIVEUP_MS) {
-      setMsg(msg, 'No reply from the locker. It may be offline; the locker ignores commands older than 2 minutes.', 'bad');
+      setMsg(msg, DEMO ? 'No reply from the locker. It may be offline; the locker ignores commands older than 2 minutes.'
+        : 'No reply from the locker. It may be offline or its Wi-Fi may be down.', 'bad');
       pending = null;
     } else if (waited > CMD_SLOW_MS) {
       setMsg(msg, `Still waiting for the locker (${secs} s). Check that it is powered and on Wi-Fi.`, 'wait');
     } else {
-      setMsg(msg, `${pending.verb === 'ARM' ? 'Arm' : 'Disarm'} command sent. Waiting for the locker to confirm (${secs} s, usually under 20 s)…`, 'wait');
+      setMsg(msg, `${pending.verb === 'ARM' ? 'Arm' : 'Disarm'} command sent. Waiting for the locker to confirm${DEMO ? ` (${secs} s, usually under 20 s)` : ''}…`, 'wait');
     }
   }
   async function send(verb, pin) {
@@ -689,8 +779,9 @@
     renderAll();
     setMsg($('cmdMsg'), 'Sending…', 'wait');
     try {
+      pending = { id: '', verb, at: Date.now() };       // set first: the locker's reply can beat the publish confirmation
       const id = await source.command(`${verb} ${pin}`);
-      pending = { id, verb, at: Date.now() };
+      if (pending) pending.id = id;
       checkPending();
     } catch (e) {
       pending = null;
@@ -738,11 +829,11 @@
     $('testBtn').addEventListener('click', testConnection);
     $('setupBack').addEventListener('click', enterDash);
     $('resetBtn').addEventListener('click', () => {
-      if (confirm('Forget the ThingSpeak keys and the PIN saved in this browser?')) resetAll();
+      if (confirm('Forget the broker login and the PIN saved in this browser?')) resetAll();
     });
     $('forgotBtn').addEventListener('click', () => {
       if (DEMO) { setMsg($('loginMsg'), 'The demo PIN is 1234.', 'wait'); return; }
-      if (confirm('Reset this dashboard? You will need to enter the ThingSpeak keys and choose the PIN again. The locker itself keeps OWNER_PIN from the firmware.')) resetAll();
+      if (confirm('Reset this dashboard? You will need to enter the broker login and choose the PIN again. The locker itself keeps OWNER_PIN from the firmware.')) resetAll();
     });
     $('settingsBtn').addEventListener('click', () => { stopDash(); openSetup(false); });
     $('logoutBtn').addEventListener('click', () => logout('Dashboard locked.'));
@@ -792,6 +883,8 @@
         if (!sessionOk()) { logout('Locked after 10 minutes without activity.'); return; }
         renderPill();
         checkPending();
+        const last = entries[entries.length - 1];       // live countdown during the 10 s exit delay
+        if (last && last.state === 0 && last.armed === 1 && last.exitLeft != null) $('stateDesc').textContent = descFor(last, isOnline(last));
       }
       if (!$('loginView').hidden) refreshLock();
     }, 1000);
