@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Smart Locker Dashboard</title>
-<meta name="description" content="Owner dashboard for the Smart Anti-Theft Locker Alarm: PIN login, arm / disarm and live alerts through ThingSpeak.">
+<meta name="description" content="Owner dashboard for the Smart Anti-Theft Locker Alarm: PIN login, arm / disarm and live alerts over MQTT.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='4' y='10' width='16' height='11' rx='2' fill='%231f5fd6'/%3E%3Cpath d='M8 10V7a4 4 0 0 1 8 0v3' fill='none' stroke='%231f5fd6' stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <div id="demoBar" class="demo-bar" hidden>
-  Demo mode: a simulated locker, not connected to ThingSpeak. PIN <b>1234</b>.
+  Demo mode: a simulated locker, not connected to the MQTT broker. PIN <b>1234</b>.
   <a href="index.html">Leave demo</a>
 </div>
 
@@ -19,19 +19,19 @@
 <section id="setupView" class="view center" hidden>
   <div class="card narrow">
     <h1 id="setupTitle">Set up the dashboard</h1>
-    <p class="muted">Copy these from ThingSpeak (see <code>SETUP.md</code>, section 3). They are saved only in this browser.</p>
+    <p class="muted">Copy these from the EMQX Cloud console: the address and ports are on Deployment Overview, the user is under Access Control &gt; Authentication. Use the web user, not the device user. They are saved only in this browser.</p>
     <form id="setupForm" autocomplete="off" novalidate>
-      <label>Channel ID
-        <input name="channelId" inputmode="numeric" placeholder="e.g. 2712345" required>
+      <label>Broker address
+        <input name="brokerHost" placeholder="e.g. xxxxxxxx.ala.eu-central-1.emqxsl.com" spellcheck="false" autocapitalize="off" required>
       </label>
-      <label>Read API key <span class="opt">(leave empty if the channel is public)</span>
-        <input name="readKey" type="password" spellcheck="false">
+      <label>WebSocket (TLS) port
+        <input name="brokerPort" inputmode="numeric" placeholder="8084" required>
       </label>
-      <label>TalkBack ID
-        <input name="tbId" inputmode="numeric" placeholder="e.g. 53210" required>
+      <label>Web username
+        <input name="mqttUser" spellcheck="false" autocapitalize="off" required>
       </label>
-      <label>TalkBack API key
-        <input name="tbKey" type="password" spellcheck="false" required>
+      <label>Web password
+        <input name="mqttPass" type="password" spellcheck="false" required>
       </label>
       <fieldset>
         <legend id="pinLegend">Owner PIN</legend>
@@ -108,7 +108,7 @@
           <span class="state-icon" id="stateIcon" aria-hidden="true"></span>
           <span class="state-name" id="stateName">Waiting for data</span>
         </div>
-        <p class="state-desc" id="stateDesc">Reading the latest update from ThingSpeak…</p>
+        <p class="state-desc" id="stateDesc">Waiting for the locker…</p>
         <div class="actions">
           <button type="button" id="armBtn" class="btn primary big">Arm</button>
           <button type="button" id="disarmBtn" class="btn big">Disarm</button>
@@ -118,7 +118,7 @@
 
       <section class="tiles" aria-label="Sensor readings">
         <div class="tile"><span class="tile-label">Tilt sensor</span><b id="tTilt">–</b><span class="tile-sub" id="tTiltSub"></span></div>
-        <div class="tile"><span class="tile-label">Vibrations</span><b id="tVib">–</b><span class="tile-sub">in the last upload</span></div>
+        <div class="tile"><span class="tile-label">Vibrations</span><b id="tVib">–</b><span class="tile-sub">counted while armed</span></div>
         <div class="tile"><span class="tile-label">Alarms</span><b id="tAlarms">–</b><span class="tile-sub">since power-on</span></div>
         <div class="tile"><span class="tile-label">Email alert</span><b id="tMail">–</b><span class="tile-sub" id="tMailSub">to the owner</span></div>
       </section>
@@ -164,8 +164,8 @@
     </section>
 
     <footer class="foot muted small">
-      <span id="footSource">ThingSpeak</span> ·
-      Arm / disarm commands travel through ThingSpeak TalkBack and are checked against the PIN on the locker.
+      <span id="footSource">MQTT</span> ·
+      Arm / disarm commands travel over MQTT and are checked against the PIN on the locker.
     </footer>
   </main>
 </section>
@@ -182,6 +182,7 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
