@@ -1,40 +1,53 @@
-// Smart Anti-Theft Locker Alarm System - ESP32 (Arduino IDE, board: ESP32 Dev Module)
-// Version 2: PIN-protected web dashboard (arm / disarm), dashboard alerts and email alerts.
+// Smart Anti-Theft Locker Alarm - ESP32 (Arduino IDE, board: ESP32 Dev Module)
+// Version 3: MQTT real-time control. BOOT button and web dashboard stay in sync.
+//
+// Library needed: "PubSubClient" by Nick O'Leary (Library Manager).
 //
 // Core 1 (Arduino loop): sensors, state machine, buzzer, LEDs, BOOT button, commands.
-//                        It never waits for the network, so the alarm always reacts at once.
-// Core 0 (netTask):      HTTPS requests to ThingSpeak:
-//                          - channel update every 20 s, and soon after any change
-//                          - TalkBack poll every 5 s for ARM / DISARM commands from the dashboard
-//                          - email alert through the ThingSpeak Alerts API when an alarm starts
+//                        Never waits for the network, so the alarm always reacts at once.
+// Core 0 netTask:        MQTT only (HiveMQ Cloud, TLS 8883). Publishes the retained state
+//                        the moment anything changes and receives ARM / DISARM commands.
+// Core 0 httpTask:       ThingSpeak over HTTPS: email alert when an alarm starts,
+//                        and an optional history upload for graphs.
+//
+// MQTT topics:
+//   locker/state   ESP32 -> everyone, retained JSON (single source of truth)
+//   locker/status  ESP32 -> everyone, retained "online" / "offline" (last will)
+//   locker/ack     ESP32 -> everyone, result of each dashboard command
+//   locker/cmd     dashboard -> ESP32, text "ARM 1234" or "DISARM 1234" (never retained)
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <PubSubClient.h>
 #include <time.h>
+#include <stdarg.h>
 
 // ======================== Settings: edit these ========================
 // Wi-Fi (2.4 GHz network or phone hotspot)
 const char* WIFI_SSID = "YOUR_WIFI_NAME";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
-// ThingSpeak channel "Smart Locker Alarm": Write API key
-// Fields: 1 state | 2 armed | 3 vibrations | 4 tilt | 5 total alarms
-//         6 last command result | 7 last command id | 8 email status
-const char* TS_WRITE_KEY = "YOUR_WRITE_API_KEY";
+// HiveMQ Cloud cluster (Serverless). Use the DEVICE credentials, not the web ones.
+const char* MQTT_HOST = "YOUR_CLUSTER.s1.eu.hivemq.cloud";
+const int   MQTT_PORT = 8883;
+const char* MQTT_USER = "YOUR_DEVICE_USERNAME";
+const char* MQTT_PASS = "YOUR_DEVICE_PASSWORD";
 
-// ThingSpeak TalkBack (Apps > TalkBack): carries commands from the web dashboard
-const char* TB_ID  = "YOUR_TALKBACK_ID";
-const char* TB_KEY = "YOUR_TALKBACK_API_KEY";
-
-// ThingSpeak Alerts API key (Account > My Profile).
-// The email goes to the address the ThingSpeak account is registered with.
+// ThingSpeak is now used only for the email alert (and optional history graphs).
+// Alerts API key: ThingSpeak > Account > My Profile. The email goes to your ThingSpeak account address.
 const char* ALERTS_KEY = "YOUR_ALERTS_API_KEY";
 
-// Owner's 4-digit PIN. Use the same PIN when you set up the web dashboard.
+// Optional history graphs. Set TS_HISTORY to false to skip them completely.
+#define TS_HISTORY true
+// Channel fields: 1 state | 2 armed | 3 vibrations | 4 tilt | 5 total alarms
+//                 6 last command result | 7 last command id | 8 email status
+const char* TS_WRITE_KEY = "YOUR_WRITE_API_KEY";
+
+// Owner's 4-digit PIN. You type the same PIN in the web dashboard.
 const char* OWNER_PIN = "1234";
 
-// false = BOOT only arms; disarming needs the PIN (web dashboard or Serial Monitor)
+// false = BOOT only arms; disarming needs the PIN (dashboard or Serial Monitor)
 // true  = BOOT arms and disarms without a PIN (offline lab testing only)
 #define BOOT_CAN_DISARM false
 // ======================================================================
@@ -51,35 +64,39 @@ const char* OWNER_PIN = "1234";
 #define TILT_ACTIVE HIGH
 #define BUZZ_ON     HIGH
 
-const unsigned long ARM_DELAY      = 10000;
-const unsigned long VIB_WINDOW     = 2000;
-const unsigned long VIB_DEBOUNCE   = 100;
-const unsigned long TILT_CONFIRM   = 150;
-const unsigned long UPLOAD_PERIOD  = 20000;
-const unsigned long TS_MIN_GAP     = 15000;   // ThingSpeak free-tier minimum
-const unsigned long TB_POLL_PERIOD = 5000;    // how often to check for dashboard commands
-const unsigned long WIFI_BOOT_WAIT = 15000;
-const unsigned long WIFI_RETRY     = 15000;
-const unsigned long HTTP_TIMEOUT   = 6000;
-const int           PIN_MAX_TRIES  = 5;
-const unsigned long PIN_LOCKOUT    = 300000;  // 5 min lock after 5 wrong PINs
-const long          CMD_MAX_AGE    = 120;     // s; older dashboard commands are ignored
-const long          TZ_OFFSET_SEC  = 19800;   // IST (UTC+5:30), used for email timestamps
-const unsigned long MAIL_RETRY_WAIT = 30000;  // after a network error
+const char* T_STATE  = "locker/state";
+const char* T_STATUS = "locker/status";
+const char* T_ACK    = "locker/ack";
+const char* T_CMD    = "locker/cmd";
+
+const unsigned long ARM_DELAY       = 10000;
+const unsigned long VIB_WINDOW      = 2000;
+const unsigned long VIB_DEBOUNCE    = 100;
+const unsigned long TILT_CONFIRM    = 150;
+const unsigned long HEARTBEAT       = 30000;   // state is re-published at least this often
+const unsigned long MQTT_RETRY      = 5000;
+const unsigned long UPLOAD_PERIOD   = 60000;   // ThingSpeak history
+const unsigned long TS_MIN_GAP      = 15000;   // ThingSpeak free-tier minimum
+const unsigned long WIFI_BOOT_WAIT  = 15000;
+const unsigned long WIFI_RETRY      = 15000;
+const unsigned long HTTP_TIMEOUT    = 6000;
+const int           PIN_MAX_TRIES   = 5;
+const unsigned long PIN_LOCKOUT     = 300000;  // 5 min lock after 5 wrong PINs
+const long          TZ_OFFSET_SEC   = 19800;   // IST (UTC+5:30), used for email timestamps
+const unsigned long MAIL_RETRY_WAIT = 30000;   // after a network error
 const unsigned long MAIL_RATE_WAIT  = 300000;  // after HTTP 429 (limit: 2 alerts per 30 min)
 
 enum State { DISARMED = 0, ARMED = 1, TAMPER = 2, THEFT = 3 };
 const char* STATE_NAME[] = { "DISARMED", "ARMED", "TAMPER", "THEFT" };
 
-// Field 6: result of the last dashboard command
 enum CmdResult { CMD_NONE = 0, CMD_ARMED = 1, CMD_DISARMED = 2, CMD_WRONG_PIN = 3,
-                 CMD_LOCKED = 4, CMD_EXPIRED = 5, CMD_INVALID = 6 };
-const char* CMD_NAME[] = { "none", "armed", "disarmed", "wrong PIN", "locked out", "expired", "invalid" };
+                 CMD_LOCKED = 4, CMD_INVALID = 5 };
+const char* CMD_NAME[] = { "none", "armed", "disarmed", "wrong PIN", "locked out", "invalid" };
 
-// Field 8: email alert status
+// Email status
 enum MailStatus { MAIL_NONE = 0, MAIL_PENDING = 1, MAIL_SENT = 2, MAIL_RETRY = 3, MAIL_OFF = 4 };
 
-// ---------- Shared between the alarm loop and netTask (guarded by `lock`) ----------
+// ---------- Shared between the alarm loop and the network tasks (guarded by `lock`) ----------
 SemaphoreHandle_t lock;
 #define LOCK()   xSemaphoreTake(lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(lock)
@@ -88,11 +105,15 @@ State state = DISARMED;
 bool  armed = false;
 bool  tilt = false;
 int   totalAlarms = 0;
-int   vibSinceUpload = 0;
-bool  pendingUpload = true;
+int   vibTotal = 0;           // shown on the dashboard
+int   vibSinceUpload = 0;     // ThingSpeak history
+bool  pendingPublish = true;  // MQTT state needs publishing
+bool  pendingUpload = true;   // ThingSpeak history needs an upload
 int   cmdResult = CMD_NONE;
 unsigned long cmdId = 0;
 char  statusMsg[120] = "Started";
+unsigned long armTime = 0;
+volatile bool mqttUp = false;
 
 bool  mailWanted = false;
 State mailState = DISARMED;
@@ -100,13 +121,18 @@ int   mailCount = 0;
 char  mailTime[32] = "";
 int   mailStatus = MAIL_NONE;
 
-// Commands from netTask (TalkBack) to the alarm loop
-struct Command { char text[64]; unsigned long id; long ageSec; };
-QueueHandle_t cmdQueue;
+struct Command { char text[64]; unsigned long id; };
+struct Ack     { unsigned long id; int code; };
+QueueHandle_t cmdQueue;   // netTask -> alarm loop
+QueueHandle_t ackQueue;   // alarm loop -> netTask
+
+// Call with `lock` held. One place that says "something changed, tell everyone".
+void markChanged() {
+  pendingPublish = true;
+  pendingUpload = true;
+}
 
 // ---------- Used only by the alarm loop ----------
-unsigned long armTime = 0;
-
 const int VIB_COUNT = 3;
 unsigned long vibTimes[VIB_COUNT] = {0};
 int  vibIdx = 0;
@@ -132,7 +158,7 @@ void buzz(bool on) {
   digitalWrite(PIN_BUZZ, on ? BUZZ_ON : !BUZZ_ON);
 }
 
-// Human-readable status: printed, and sent to ThingSpeak as the entry's status text
+// Human-readable status: printed, and shown on the dashboard
 void setStatus(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -180,7 +206,7 @@ void arm(const char* by) {
   for (int i = 0; i < VIB_COUNT; i++) vibTimes[i] = 0;
   if (tilt) setStatus("Arming in 10 s (%s) - WARNING: locker is tilted, level it", by);
   else      setStatus("Arming in 10 s (%s) - close the locker", by);
-  pendingUpload = true;
+  markChanged();
 }
 
 void disarm(const char* by) {
@@ -188,11 +214,11 @@ void disarm(const char* by) {
   armed = false;
   state = DISARMED;
   setStatus(wasAlarm ? "Disarmed by %s - alarm cleared" : "Disarmed by %s", by);
-  pendingUpload = true;
+  markChanged();
 }
 
-// Text is "ARM 1234" or "DISARM 1234" (":" also accepted). ageSec < 0 = age unknown.
-int runCommand(const char* text, long ageSec, const char* source) {
+// Text is "ARM 1234" or "DISARM 1234" (":" also accepted).
+int runCommand(const char* text, const char* source) {
   char buf[64], verb[16] = "", pin[16] = "";
   strncpy(buf, text, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = 0;
@@ -207,10 +233,6 @@ int runCommand(const char* text, long ageSec, const char* source) {
   if (!isArm && !isDisarm) {
     setStatus("Unknown command from %s", source);
     return CMD_INVALID;
-  }
-  if (ageSec > CMD_MAX_AGE) {
-    setStatus("Ignored %s from %s: sent %ld s ago (expired)", verb, source, ageSec);
-    return CMD_EXPIRED;
   }
   if (lockedOut) {
     unsigned long left = (PIN_LOCKOUT - (millis() - lockoutStart)) / 1000;
@@ -239,9 +261,11 @@ int runCommand(const char* text, long ageSec, const char* source) {
 void handleCommands() {
   Command c;
   while (xQueueReceive(cmdQueue, &c, 0) == pdTRUE) {
-    cmdResult = runCommand(c.text, c.ageSec, "dashboard");
+    cmdResult = runCommand(c.text, "dashboard");
     cmdId = c.id;
-    pendingUpload = true;
+    Ack a = { c.id, cmdResult };
+    xQueueSend(ackQueue, &a, 0);
+    markChanged();
     Serial.printf("[CMD] dashboard command #%lu -> %s\n", c.id, CMD_NAME[cmdResult]);
   }
 }
@@ -257,13 +281,14 @@ void handleSerial() {
     serialLen = 0;
     if (serialLine[0] == 0) continue;
     if (strcasecmp(serialLine, "STATUS") == 0) {
-      Serial.printf("[INFO] state=%s armed=%d tilt=%d alarms=%d wifi=%s | %s\n", STATE_NAME[state], armed,
-                    tilt, totalAlarms, WiFi.status() == WL_CONNECTED ? "up" : "down", statusMsg);
+      Serial.printf("[INFO] state=%s armed=%d tilt=%d alarms=%d wifi=%s mqtt=%s | %s\n", STATE_NAME[state],
+                    armed, tilt, totalAlarms, WiFi.status() == WL_CONNECTED ? "up" : "down",
+                    mqttUp ? "up" : "down", statusMsg);
       continue;
     }
-    int r = runCommand(serialLine, -1, "Serial Monitor");
+    int r = runCommand(serialLine, "Serial Monitor");
     Serial.printf("[CMD] Serial command -> %s\n", CMD_NAME[r]);
-    pendingUpload = true;
+    markChanged();
   }
 }
 
@@ -284,6 +309,7 @@ void readTilt() {
   if (tiltRaw != tilt && millis() - tiltChangeTime >= TILT_CONFIRM) {
     tilt = tiltRaw;
     Serial.printf("[TILT] %s\n", tilt ? "tilted / lifted" : "level");
+    markChanged();
   }
 }
 
@@ -298,6 +324,7 @@ bool checkTamper(bool active) {
       Serial.println("[VIB] pulse (ignored: not armed)");
     } else {
       vibSinceUpload++;
+      vibTotal++;
       vibTimes[vibIdx] = now;
       vibIdx = (vibIdx + 1) % VIB_COUNT;
       unsigned long oldest = vibTimes[vibIdx];
@@ -306,13 +333,14 @@ bool checkTamper(bool active) {
         if (vibTimes[i] != 0 && now - vibTimes[i] <= VIB_WINDOW) inWindow++;
       Serial.printf("[VIB] vibration (%d of %d in last 2 s)\n", inWindow, VIB_COUNT);
       if (oldest != 0 && now - oldest <= VIB_WINDOW) hit = true;
+      markChanged();
     }
   }
   lastVib = v;
   return hit;
 }
 
-// Queue an email for netTask. Alarms that happen before it is sent are merged into one email.
+// Queue an email for httpTask. Alarms that happen before it is sent are merged into one email.
 void requestEmail(State s) {
   if (!isSet(ALERTS_KEY)) { mailStatus = MAIL_OFF; return; }
   if (!mailWanted) { timeText(mailTime, sizeof(mailTime)); mailState = s; mailCount = 0; }
@@ -344,7 +372,7 @@ void updateState() {
       setStatus("Armed - locker protected");
     }
     state = next;
-    pendingUpload = true;
+    markChanged();
   }
 }
 
@@ -388,7 +416,123 @@ void reportWiFiChanges() {
   }
 }
 
-// ======================= Network task (core 0) =======================
+// ======================= MQTT task (core 0) =======================
+
+WiFiClientSecure tlsMqtt;
+PubSubClient mqtt(tlsMqtt);
+unsigned long cmdSeq = 0;
+
+// Runs inside mqtt.loop(): hand the command to the alarm loop. The PIN is never printed.
+void onMqttMessage(char* topic, byte* payload, unsigned int len) {
+  if (strcmp(topic, T_CMD) != 0) return;
+  Command c;
+  size_t n = len < sizeof(c.text) - 1 ? len : sizeof(c.text) - 1;
+  memcpy(c.text, payload, n);
+  c.text[n] = 0;
+  c.id = ++cmdSeq;
+  Serial.printf("[MQTT] command #%lu received\n", c.id);
+  xQueueSend(cmdQueue, &c, 0);
+}
+
+void jsonSafe(char* s) {
+  for (; *s; s++) if (*s == '"' || *s == '\\' || (unsigned char)*s < 32) *s = ' ';
+}
+
+void publishState() {
+  LOCK();
+  int st = state, ar = armed, ti = tilt, al = totalAlarms, vt = vibTotal, ms = mailStatus;
+  unsigned long left = 0;
+  if (armed && millis() - armTime < ARM_DELAY) left = (ARM_DELAY - (millis() - armTime) + 999) / 1000;
+  char msg[120];
+  strncpy(msg, statusMsg, sizeof(msg) - 1);
+  msg[sizeof(msg) - 1] = 0;
+  pendingPublish = false;                      // set again by any change during the publish
+  UNLOCK();
+  jsonSafe(msg);
+
+  char buf[420];
+  snprintf(buf, sizeof(buf),
+           "{\"state\":%d,\"name\":\"%s\",\"armed\":%d,\"exitLeft\":%lu,\"tilt\":%d,"
+           "\"vib\":%d,\"alarms\":%d,\"mail\":%d,\"rssi\":%d,\"up\":%lu,\"msg\":\"%s\"}",
+           st, STATE_NAME[st], ar, left, ti, vt, al, ms, WiFi.RSSI(), millis() / 1000, msg);
+  if (!mqtt.publish(T_STATE, buf, true)) {
+    Serial.println("[MQTT] state publish failed, will retry");
+    LOCK(); pendingPublish = true; UNLOCK();
+  }
+}
+
+void publishAcks() {
+  Ack a;
+  while (xQueueReceive(ackQueue, &a, 0) == pdTRUE) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"id\":%lu,\"code\":%d,\"result\":\"%s\"}", a.id, a.code, CMD_NAME[a.code]);
+    mqtt.publish(T_ACK, buf, false);
+  }
+}
+
+bool mqttConnect() {
+  char cid[32];
+  snprintf(cid, sizeof(cid), "locker-%06X", (unsigned)(ESP.getEfuseMac() >> 24));
+  Serial.printf("[MQTT] connecting to %s as %s ... ", MQTT_HOST, cid);
+  // clean session = true, so commands sent while the device was offline are never replayed
+  bool ok = mqtt.connect(cid, MQTT_USER, MQTT_PASS, T_STATUS, 1, true, "offline", true);
+  if (!ok) {
+    Serial.printf("failed, rc=%d (-2 network/TLS, 4 or 5 = wrong user/password)\n", mqtt.state());
+    return false;
+  }
+  Serial.println("connected");
+  mqtt.publish(T_STATUS, "online", true);
+  mqtt.subscribe(T_CMD, 1);
+  LOCK(); pendingPublish = true; UNLOCK();     // publish the real state straight away
+  return true;
+}
+
+void netTask(void*) {
+  tlsMqtt.setInsecure();   // lab simplification: encrypted, but the server certificate is not checked
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
+  mqtt.setBufferSize(768);
+  mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(5);
+
+  unsigned long lastTry = 0, lastPublish = 0, lastWiFiRetry = 0;
+  bool firstTry = true;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      mqttUp = false;
+      if (millis() - lastWiFiRetry >= WIFI_RETRY) { lastWiFiRetry = millis(); WiFi.reconnect(); }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    if (!mqtt.connected()) {
+      if (mqttUp) { mqttUp = false; Serial.println("[MQTT] connection lost, reconnecting"); }
+      if (firstTry || millis() - lastTry >= MQTT_RETRY) {
+        firstTry = false;
+        lastTry = millis();
+        if (mqttConnect()) { mqttUp = true; lastPublish = millis(); }
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    mqtt.loop();
+    publishAcks();
+
+    LOCK();
+    bool pend = pendingPublish;
+    UNLOCK();
+    if (pend || millis() - lastPublish >= HEARTBEAT) {
+      publishState();
+      lastPublish = millis();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// ======================= HTTP task (core 0): email + history =======================
 
 String urlEncode(const char* s) {
   String out;
@@ -400,84 +544,6 @@ String urlEncode(const char* s) {
     else { out += '%'; out += hex[(c >> 4) & 15]; out += hex[c & 15]; }
   }
   return out;
-}
-
-// Minimal JSON reader for ThingSpeak's flat replies: returns the value of "key", or "" if missing/null
-String jsonField(const String& json, const char* key) {
-  String pat = String("\"") + key + "\":";
-  int i = json.indexOf(pat);
-  if (i < 0) return "";
-  i += pat.length();
-  while (i < (int)json.length() && json[i] == ' ') i++;
-  if (i >= (int)json.length()) return "";
-  if (json[i] == '"') {
-    int j = json.indexOf('"', i + 1);
-    return j < 0 ? "" : json.substring(i + 1, j);
-  }
-  int j = i;
-  while (j < (int)json.length() && json[j] != ',' && json[j] != '}') j++;
-  String v = json.substring(i, j);
-  v.trim();
-  return v == "null" ? "" : v;
-}
-
-long daysFromCivil(int y, int m, int d) {
-  y -= m <= 2;
-  long era = (y >= 0 ? y : y - 399) / 400;
-  long yoe = y - era * 400;
-  long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + doe - 719468;
-}
-
-// Age in seconds of a TalkBack command from its created_at ("2026-11-24T05:08:16Z"); -1 if unknown
-long commandAge(const String& iso) {
-  time_t now = time(nullptr);
-  int Y, M, D, h, m, s;
-  if (now < 1700000000 || sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6) return -1;
-  long offset = 0;
-  const char* z = iso.c_str() + 19;
-  while (*z == '.' || isdigit((unsigned char)*z)) z++;
-  if (*z == '+' || *z == '-') {
-    int oh = 0, om = 0;
-    sscanf(z + 1, "%d:%d", &oh, &om);
-    offset = (oh * 3600L + om * 60L) * (*z == '-' ? -1 : 1);
-  }
-  long long created = (long long)daysFromCivil(Y, M, D) * 86400LL + h * 3600L + m * 60L + s - offset;
-  long age = (long)((long long)now - created);
-  return age < 0 ? 0 : age;
-}
-
-void pollTalkBack(WiFiClientSecure& tls) {
-  static int lastCode = 200;
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_TIMEOUT);
-  http.setTimeout(HTTP_TIMEOUT);
-  http.begin(tls, String("https://api.thingspeak.com/talkbacks/") + TB_ID + "/commands/execute.json");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int code = http.POST(String("api_key=") + TB_KEY);
-  String resp = code > 0 ? http.getString() : String("");
-  http.end();
-
-  if (code != 200) {
-    if (code != lastCode)
-      Serial.printf("[TALKBACK] poll failed, HTTP %d%s\n", code,
-                    code == 401 || code == 404 ? " (check TB_ID and TB_KEY)" : "");
-    lastCode = code;
-    return;
-  }
-  lastCode = 200;
-
-  String text = jsonField(resp, "command_string");
-  if (text.length() == 0) return;              // queue empty: ThingSpeak returns {}
-
-  Command c;
-  strncpy(c.text, text.c_str(), sizeof(c.text) - 1);
-  c.text[sizeof(c.text) - 1] = 0;
-  c.id = strtoul(jsonField(resp, "id").c_str(), nullptr, 10);
-  c.ageSec = commandAge(jsonField(resp, "created_at"));
-  Serial.printf("[TALKBACK] command #%lu received (age %ld s)\n", c.id, c.ageSec);
-  xQueueSend(cmdQueue, &c, 0);
 }
 
 void uploadChannel(WiFiClientSecure& tls) {
@@ -504,8 +570,8 @@ void uploadChannel(WiFiClientSecure& tls) {
   http.end();
   resp.trim();
 
-  Serial.printf("[CLOUD] state=%d armed=%d vib=%d tilt=%d alarms=%d cmd=%d/#%lu mail=%d -> HTTP %d, entry %s\n",
-                st, ar, vib, ti, al, cr, ci, ms, code, resp.c_str());
+  Serial.printf("[HISTORY] state=%d armed=%d vib=%d alarms=%d -> HTTP %d, entry %s\n",
+                st, ar, vib, al, code, resp.c_str());
 
   bool ok = code == 200 && resp != "0" && resp.length() > 0;
   LOCK();
@@ -516,8 +582,8 @@ void uploadChannel(WiFiClientSecure& tls) {
     pendingUpload = true;
   }
   UNLOCK();
-  if (!ok && code == 200) Serial.println("[CLOUD] ThingSpeak returned 0: wrong Write API key or < 15 s since last update");
-  else if (!ok)           Serial.println("[CLOUD] upload failed, will retry");
+  if (!ok && code == 200) Serial.println("[HISTORY] ThingSpeak returned 0: wrong Write API key or < 15 s since last update");
+  else if (!ok)           Serial.println("[HISTORY] upload failed, will retry");
 }
 
 // Returns the delay before the next email attempt (0 = nothing to retry)
@@ -565,7 +631,7 @@ unsigned long sendEmail(WiFiClientSecure& tls) {
     mailWanted = true;
     mailStatus = MAIL_RETRY;
   }
-  pendingUpload = true;
+  markChanged();
   UNLOCK();
 
   if (ok) {
@@ -581,39 +647,33 @@ unsigned long sendEmail(WiFiClientSecure& tls) {
   return MAIL_RETRY_WAIT;
 }
 
-void netTask(void*) {
+void httpTask(void*) {
   WiFiClientSecure tls;
   tls.setInsecure();   // lab simplification: encrypted, but the server certificate is not checked
-  unsigned long lastUpload = 0, lastPoll = 0, lastWiFiRetry = 0, mailBlockedAt = 0, mailWait = 0;
-  bool tbOn = isSet(TB_ID) && isSet(TB_KEY);
+  unsigned long lastUpload = 0, mailBlockedAt = 0, mailWait = 0;
+  bool historyOn = TS_HISTORY && isSet(TS_WRITE_KEY);
 
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED) {
-      if (millis() - lastWiFiRetry >= WIFI_RETRY) { lastWiFiRetry = millis(); WiFi.reconnect(); }
-      vTaskDelay(pdMS_TO_TICKS(200));
-      continue;
-    }
-
-    if (tbOn && millis() - lastPoll >= TB_POLL_PERIOD) {
-      lastPoll = millis();
-      pollTalkBack(tls);
-    }
+    if (WiFi.status() != WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
 
     if (millis() - mailBlockedAt >= mailWait) {
       unsigned long w = sendEmail(tls);
       if (w) { mailBlockedAt = millis(); mailWait = w; }
+      else   { mailWait = 0; }
     }
 
-    LOCK();
-    bool pend = pendingUpload;
-    UNLOCK();
-    unsigned long since = millis() - lastUpload;
-    if (since >= UPLOAD_PERIOD || (pend && since >= TS_MIN_GAP)) {
-      uploadChannel(tls);
-      lastUpload = millis();
+    if (historyOn) {
+      LOCK();
+      bool pend = pendingUpload;
+      UNLOCK();
+      unsigned long since = millis() - lastUpload;
+      if (since >= UPLOAD_PERIOD || (pend && since >= TS_MIN_GAP)) {
+        uploadChannel(tls);
+        lastUpload = millis();
+      }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
@@ -623,6 +683,7 @@ void setup() {
   Serial.begin(115200);
   lock = xSemaphoreCreateMutex();
   cmdQueue = xQueueCreate(4, sizeof(Command));
+  ackQueue = xQueueCreate(8, sizeof(Ack));
 
   pinMode(PIN_BTN,  INPUT_PULLUP);
   pinMode(PIN_VIB,  INPUT);
@@ -636,7 +697,7 @@ void setup() {
 
   delay(200);
   Serial.println();
-  Serial.println("=== Smart Anti-Theft Locker Alarm v2 (web dashboard + email alerts) ===");
+  Serial.println("=== Smart Anti-Theft Locker Alarm v3 (MQTT real-time + email alerts) ===");
   Serial.printf("Sensor levels at start: VIB=%d  TILT=%d (box should be level)\n",
                 digitalRead(PIN_VIB), digitalRead(PIN_TILT));
 
@@ -647,15 +708,17 @@ void setup() {
   tiltRaw = digitalRead(PIN_TILT) == TILT_ACTIVE;
   tilt = tiltRaw;
 
-  if (!isSet(TS_WRITE_KEY))         Serial.println("[CONFIG] TS_WRITE_KEY not set: cloud uploads will fail");
-  if (!isSet(TB_ID) || !isSet(TB_KEY)) Serial.println("[CONFIG] TalkBack not set: dashboard arm/disarm is off");
-  if (!isSet(ALERTS_KEY))           Serial.println("[CONFIG] ALERTS_KEY not set: email alerts are off");
-  if (strlen(OWNER_PIN) != 4)       Serial.println("[CONFIG] OWNER_PIN must be exactly 4 digits");
+  bool mqttOk = isSet(MQTT_HOST) && isSet(MQTT_USER) && isSet(MQTT_PASS);
+  if (!mqttOk)                Serial.println("[CONFIG] MQTT_HOST / MQTT_USER / MQTT_PASS not set: dashboard control is off");
+  if (!isSet(ALERTS_KEY))     Serial.println("[CONFIG] ALERTS_KEY not set: email alerts are off");
+  if (TS_HISTORY && !isSet(TS_WRITE_KEY)) Serial.println("[CONFIG] TS_WRITE_KEY not set: history graphs are off");
+  if (strlen(OWNER_PIN) != 4) Serial.println("[CONFIG] OWNER_PIN must be exactly 4 digits");
 
   startWiFi();
-  configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");   // clock for command age and email time
+  configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");   // clock for email time
 
-  xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
+  if (mqttOk) xTaskCreatePinnedToCore(netTask, "mqtt", 20480, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(httpTask, "http", 20480, nullptr, 1, nullptr, 0);
 
   Serial.println("Arm: press BOOT or use the web dashboard (10 s exit delay).");
   Serial.println("Disarm: web dashboard with the PIN, or type  DISARM <pin>  here. Type STATUS for a summary.");
@@ -666,6 +729,7 @@ void loop() {
   if (lockedOut && millis() - lockoutStart >= PIN_LOCKOUT) {
     lockedOut = false;
     setStatus("PIN lockout over - commands accepted again");
+    markChanged();
   }
   handleButton();
   handleSerial();
