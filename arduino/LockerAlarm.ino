@@ -5,7 +5,7 @@
 //
 // Core 1 (Arduino loop): sensors, state machine, buzzer, LEDs, BOOT button, commands.
 //                        Never waits for the network, so the alarm always reacts at once.
-// Core 0 netTask:        MQTT only (HiveMQ Cloud, TLS 8883). Publishes the retained state
+// Core 0 netTask:        MQTT only (EMQX Cloud, TLS 8883). Publishes the retained state
 //                        the moment anything changes and receives ARM / DISARM commands.
 // Core 0 httpTask:       ThingSpeak over HTTPS: email alert when an alarm starts,
 //                        and an optional history upload for graphs.
@@ -28,8 +28,9 @@
 const char* WIFI_SSID = "YOUR_WIFI_NAME";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
-// HiveMQ Cloud cluster (Serverless). Use the DEVICE credentials, not the web ones.
-const char* MQTT_HOST = "YOUR_CLUSTER.s1.eu.hivemq.cloud";
+// EMQX Cloud deployment (Serverless). Address: Deployment Overview. User: Access Control >
+// Authentication. Use the DEVICE user here, not the web (dashboard) user.
+const char* MQTT_HOST = "YOUR_DEPLOYMENT.emqxsl.com";
 const int   MQTT_PORT = 8883;
 const char* MQTT_USER = "YOUR_DEVICE_USERNAME";
 const char* MQTT_PASS = "YOUR_DEVICE_PASSWORD";
