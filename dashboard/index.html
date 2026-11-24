@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Locker Dashboard</title>
+<meta name="description" content="Owner dashboard for the Smart Anti-Theft Locker Alarm: PIN login, arm / disarm and live alerts through ThingSpeak.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='4' y='10' width='16' height='11' rx='2' fill='%231f5fd6'/%3E%3Cpath d='M8 10V7a4 4 0 0 1 8 0v3' fill='none' stroke='%231f5fd6' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="demoBar" class="demo-bar" hidden>
+  Demo mode: a simulated locker, not connected to ThingSpeak. PIN <b>1234</b>.
+  <a href="index.html">Leave demo</a>
+</div>
+
+<!-- ============ First-run setup / settings ============ -->
+<section id="setupView" class="view center" hidden>
+  <div class="card narrow">
+    <h1 id="setupTitle">Set up the dashboard</h1>
+    <p class="muted">Copy these from ThingSpeak (see <code>SETUP.md</code>, section 3). They are saved only in this browser.</p>
+    <form id="setupForm" autocomplete="off" novalidate>
+      <label>Channel ID
+        <input name="channelId" inputmode="numeric" placeholder="e.g. 2712345" required>
+      </label>
+      <label>Read API key <span class="opt">(leave empty if the channel is public)</span>
+        <input name="readKey" type="password" spellcheck="false">
+      </label>
+      <label>TalkBack ID
+        <input name="tbId" inputmode="numeric" placeholder="e.g. 53210" required>
+      </label>
+      <label>TalkBack API key
+        <input name="tbKey" type="password" spellcheck="false" required>
+      </label>
+      <fieldset>
+        <legend id="pinLegend">Owner PIN</legend>
+        <div class="two">
+          <label>4-digit PIN
+            <input name="pin1" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password">
+          </label>
+          <label>Repeat PIN
+            <input name="pin2" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password">
+          </label>
+        </div>
+        <p class="hint" id="pinHint">Use the same PIN as <code>OWNER_PIN</code> in the firmware. The locker checks it again for every arm / disarm.</p>
+      </fieldset>
+      <div class="row">
+        <button type="button" id="testBtn" class="btn">Test connection</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+      <p id="setupMsg" class="msg" role="status"></p>
+    </form>
+    <div class="row split foot-links">
+      <button type="button" id="setupBack" class="link" hidden>Back to dashboard</button>
+      <a id="demoLink" href="?demo" class="link">Try the demo</a>
+      <button type="button" id="resetBtn" class="link danger" hidden>Forget all settings</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PIN login ============ -->
+<section id="loginView" class="view center" hidden>
+  <div class="card narrow login">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="30" height="30"><rect x="4" y="10" width="16" height="11" rx="2" fill="currentColor"/><path d="M8 10V7a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2.4"/></svg>
+    </div>
+    <h1>Smart Locker</h1>
+    <p class="muted">Enter your 4-digit PIN</p>
+    <div class="pin-dots" id="loginDots" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+    <p id="loginMsg" class="msg" role="alert"></p>
+    <div class="keypad" id="loginPad"></div>
+    <button type="button" id="forgotBtn" class="link small-link">Forgot PIN?</button>
+  </div>
+</section>
+
+<!-- ============ Dashboard ============ -->
+<section id="dashView" class="view" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2" fill="currentColor"/><path d="M8 10V7a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2.4"/></svg>
+      <span>Smart Locker</span>
+    </div>
+    <div class="top-right">
+      <span id="linkPill" class="pill"><i></i><span>Connecting…</span></span>
+      <button type="button" id="notifyBtn" class="btn small" hidden>Enable notifications</button>
+      <button type="button" id="settingsBtn" class="btn small ghost" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.3 7.3 0 0 0-1.7-1L15 3.5h-4l-.4 2.5a7.3 7.3 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.6a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.3 7.3 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7.3 7.3 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></svg>
+      </button>
+      <button type="button" id="logoutBtn" class="btn small">Lock</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="alertBanner" class="alert" hidden role="alert">
+      <div class="alert-icon" aria-hidden="true">!</div>
+      <div class="alert-text">
+        <strong id="alertTitle">Theft alert</strong>
+        <span id="alertDetail"></span>
+      </div>
+      <button type="button" id="silenceBtn" class="btn small on-alert">Silence sound</button>
+    </div>
+
+    <div class="grid">
+      <section class="card state-card" id="stateCard" data-state="none" aria-live="polite">
+        <div class="eyebrow">Locker status</div>
+        <div class="state-row">
+          <span class="state-icon" id="stateIcon" aria-hidden="true"></span>
+          <span class="state-name" id="stateName">Waiting for data</span>
+        </div>
+        <p class="state-desc" id="stateDesc">Reading the latest update from ThingSpeak…</p>
+        <div class="actions">
+          <button type="button" id="armBtn" class="btn primary big">Arm</button>
+          <button type="button" id="disarmBtn" class="btn big">Disarm</button>
+        </div>
+        <p id="cmdMsg" class="msg" role="status"></p>
+      </section>
+
+      <section class="tiles" aria-label="Sensor readings">
+        <div class="tile"><span class="tile-label">Tilt sensor</span><b id="tTilt">–</b><span class="tile-sub" id="tTiltSub"></span></div>
+        <div class="tile"><span class="tile-label">Vibrations</span><b id="tVib">–</b><span class="tile-sub">in the last upload</span></div>
+        <div class="tile"><span class="tile-label">Alarms</span><b id="tAlarms">–</b><span class="tile-sub">since power-on</span></div>
+        <div class="tile"><span class="tile-label">Email alert</span><b id="tMail">–</b><span class="tile-sub" id="tMailSub">to the owner</span></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>State timeline</h2>
+        <span class="muted small" id="timelineRange"></span>
+      </div>
+      <div id="timeline" class="timeline" role="img" aria-label="Locker state for each recent update"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="sw s0"></i>Disarmed</span>
+        <span><i class="sw s1"></i>Armed</span>
+        <span><i class="sw s2"></i>Tamper</span>
+        <span><i class="sw s3"></i>Theft</span>
+      </div>
+      <div id="tip" class="tip" hidden></div>
+    </section>
+
+    <div class="grid2">
+      <section class="card">
+        <h2>Alarm history</h2>
+        <ul id="alarmList" class="list"><li class="empty">No alarms in the recent history.</li></ul>
+      </section>
+      <section class="card">
+        <h2>Activity</h2>
+        <ul id="activityList" class="list"><li class="empty">No activity yet.</li></ul>
+      </section>
+    </div>
+
+    <section class="card demo-panel" id="demoPanel" hidden>
+      <h2>Demo controls</h2>
+      <p class="muted">Act on the simulated locker the way the sensors would.</p>
+      <div class="row wrap-row">
+        <button type="button" class="btn" data-sim="knock">One knock</button>
+        <button type="button" class="btn" data-sim="tamper">Three knocks (tamper)</button>
+        <button type="button" class="btn" data-sim="theft">Lift / tilt (theft)</button>
+        <button type="button" class="btn" data-sim="level">Put it back level</button>
+        <button type="button" class="btn" data-sim="boot">Press BOOT</button>
+        <button type="button" class="btn" data-sim="wifi">Wi-Fi on / off</button>
+      </div>
+    </section>
+
+    <footer class="foot muted small">
+      <span id="footSource">ThingSpeak</span> ·
+      Arm / disarm commands travel through ThingSpeak TalkBack and are checked against the PIN on the locker.
+    </footer>
+  </main>
+</section>
+
+<!-- ============ PIN confirm for arm / disarm ============ -->
+<div id="pinModal" class="modal" hidden>
+  <div class="card narrow modal-card" role="dialog" aria-modal="true" aria-labelledby="pinTitle">
+    <h2 id="pinTitle">Confirm with your PIN</h2>
+    <p class="muted" id="pinSub"></p>
+    <div class="pin-dots" id="modalDots" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+    <p id="modalMsg" class="msg" role="alert"></p>
+    <div class="keypad" id="modalPad"></div>
+    <button type="button" id="modalCancel" class="btn wide">Cancel</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

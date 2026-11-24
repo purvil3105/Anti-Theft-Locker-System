@@ -2,67 +2,50 @@
 
 Use **Wokwi**, not Tinkercad. Tinkercad Circuits has no ESP32 and no Wi-Fi, so it cannot reach
 ThingSpeak. Wokwi simulates the ESP32 and gives it internet access through its virtual `Wokwi-GUEST` network.
+That is enough for the full version 2 system: cloud uploads, arm / disarm from the web dashboard, and email alerts.
 
 | File | What it is |
 |---|---|
-| `sketch.ino` | ESP32 firmware (the report's Appendix A, adapted for the simulator) |
-| `diagram.json` | Wokwi circuit diagram |
+| `sketch.ino` | ESP32 firmware version 2 (the report's Appendix A, adapted for the simulator) |
+| `diagram.json` | Wokwi circuit diagram (unchanged from version 1) |
 
 ---
 
-## 1. ThingSpeak cloud setup (do this first, you need the API key)
+## 1. ThingSpeak cloud setup (do this first, you need the keys)
 
-### 1.1 Account and channel
-1. Go to https://thingspeak.mathworks.com and sign in, or create a free MathWorks account.
-2. **Channels → My Channels → New Channel**, then fill in:
-
-   | Setting | Value |
-   |---|---|
-   | Name | `Smart Locker Alarm` |
-   | Field 1 | `System State` (tick the box) |
-   | Field 2 | `Armed` |
-   | Field 3 | `Vibration Events` |
-   | Field 4 | `Tilt Detected` |
-   | Field 5 | `Total Alarms` |
-
-3. Click **Save Channel**.
-4. Open the **API Keys** tab and copy the **Write API Key**. Paste it into `sketch.ino`:
-   ```cpp
-   const char* TS_API_KEY = "YOUR_WRITE_API_KEY";
-   ```
-5. To show the dashboard to others, open **Sharing** and choose **Share channel view with everyone**. The **Public View** tab then has its own link.
-
-### 1.2 Dashboard widgets (Private View tab)
-ThingSpeak creates one line chart per field automatically. Change them and add widgets like this:
-
-| Field | Edit the chart (pencil icon) or **Add Widgets** | Settings |
-|---|---|---|
-| 1 State | Chart: Type **step**, Results **60**, Y-axis min 0 max 3 | Title "System state (0 Disarmed, 1 Armed, 2 Tamper, 3 Theft)" |
-| 1 State | Widget **Numeric Display** | Name "Current state", Field 1 |
-| 2 Armed | Widget **Lamp Indicator** | Field 2, condition `>= 1`, colour green |
-| 3 Vibrations | Chart: Type **column** (bar), Results **60** | Title "Vibration events per upload" |
-| 4 Tilt | Widget **Lamp Indicator** | Field 4, condition `>= 1`, colour red |
-| 5 Total alarms | Widget **Numeric Display** | Field 5 |
-
-Drag the widgets into three rows: status (Armed lamp, Tilt lamp, Current state), history (state chart and vibration chart), and summary (Total alarms).
-To get the timestamped history as a file, use **Data Import / Export → Export recent data** (CSV).
+Follow [`../SETUP.md`](../SETUP.md), section 3. It creates:
+- the channel **Smart Locker Alarm** with 8 fields (Write and Read API keys),
+- the **TalkBack** `Locker Commands` (TalkBack ID and API key) for dashboard commands,
+- the **Alerts API key** for email alerts (sent to the ThingSpeak account's email, 2023kuec2054@iiitkota.ac.in).
 
 ---
 
 ## 2. Wokwi simulation setup
 
 1. Open https://wokwi.com/projects/new/esp32 and sign in so you can save the project.
-2. In the **sketch.ino** tab, delete the default code and paste in `sketch.ino`. Set your Write API key.
-3. Open the **diagram.json** tab, select all, and paste in `diagram.json`. The circuit appears on the right.
-4. No libraries are needed. `WiFi.h` and `HTTPClient.h` come with the ESP32 core.
-5. Click the green **▶ Start** button. The Serial Monitor should show:
+2. In the **sketch.ino** tab, delete the default code and paste in `sketch.ino`.
+3. Fill in the settings block (the Wi-Fi lines are already set for Wokwi):
+   ```cpp
+   const char* TS_WRITE_KEY = "YOUR_WRITE_API_KEY";
+   const char* TB_ID        = "YOUR_TALKBACK_ID";
+   const char* TB_KEY       = "YOUR_TALKBACK_API_KEY";
+   const char* ALERTS_KEY   = "YOUR_ALERTS_API_KEY";
+   const char* OWNER_PIN    = "1234";
    ```
-   === Smart Anti-Theft Locker Alarm ===
-   Connecting to Wi-Fi.... connected, IP 10.13.37.2
-   Press BOOT to arm (10 s exit delay).
-   [CLOUD] state=0 armed=0 vib=0 tilt=0 alarms=0 -> HTTP 200, entry 1
+4. Open the **diagram.json** tab, select all, and paste in `diagram.json`. The circuit appears on the right.
+5. No libraries are needed. `WiFi.h`, `WiFiClientSecure.h` and `HTTPClient.h` come with the ESP32 core.
+6. Click the green **▶ Start** button. The Serial Monitor should show:
    ```
-6. Click **Save** (top left) so the project gets its own URL that you can share.
+   === Smart Anti-Theft Locker Alarm v2 (web dashboard + email alerts) ===
+   Connecting to Wi-Fi "Wokwi-GUEST".... connected, IP 10.13.37.2
+   Arm: press BOOT or use the web dashboard (10 s exit delay).
+   Disarm: web dashboard with the PIN, or type  DISARM <pin>  here. Type STATUS for a summary.
+   [CLOUD] state=0 armed=0 vib=0 tilt=0 alarms=0 cmd=0/#0 mail=0 -> HTTP 200, entry 1
+   ```
+7. Click **Save** (top left) so the project gets its own URL that you can share.
+8. Open the web dashboard (`../dashboard/index.html`, see `../SETUP.md` section 5) and enter the same channel, TalkBack and PIN. It controls the simulated locker exactly like the real one.
+
+You can also type `ARM 1234`, `DISARM 1234` or `STATUS` in Wokwi's Serial Monitor input box.
 
 ### How the real sensors are simulated
 
@@ -72,7 +55,7 @@ Wokwi has no SW-420 or SW-520D model, so each sensor is replaced by a part that 
 |---|---|---|---|
 | SW-420 vibration sensor | Yellow push-button | Each click is one vibration pulse (HIGH). Keyboard: **V** | 27 |
 | SW-520D tilt sensor | Slide switch | Left = level (LOW), right = tilted/lifted (HIGH) | 26 |
-| On-board BOOT button | Blue push-button (wired GPIO 0 → GND, same as on the board) | Each click arms or disarms. Keyboard: **B** | 0 |
+| On-board BOOT button | Blue push-button (wired GPIO 0 → GND, same as on the board) | Click to arm. It does not disarm (use the dashboard or Serial) unless `BOOT_CAN_DISARM` is `true`. Keyboard: **B** | 0 |
 | Active buzzer module | Wokwi buzzer (passive, driven with `tone()`) | Sound: turn on audio in the simulator | 18 |
 | Green / red LED | LEDs through 220 Ω resistors | | 19 / 21 |
 
@@ -91,30 +74,33 @@ Red LED          : GPIO 21 -> 220 Ω -> anode, cathode -> GND
 
 ---
 
-## 3. Test plan in the simulator (report Table 7)
+## 3. Test plan in the simulator
 
 | ID | Do this in Wokwi | Expected |
 |---|---|---|
-| T1 | Start the simulation | "connected" printed, first ThingSpeak entry within about 20 s |
+| T1 | Start the simulation | "connected" printed, first ThingSpeak entry within about 20 s, dashboard "Locker online" |
 | T2 | Click **BOOT** once | Green LED blinks for 10 s, then stays on. Field 2 = 1 |
-| T3 | Click **BOOT** again | Everything off. Fields 1 and 2 = 0 |
+| T3 | Dashboard: **Disarm** + PIN | Everything off. Fields 1 and 2 = 0. Dashboard "Locker disarmed." |
 | T4 | Armed: click **VIBRATION** once | `[VIB] 1 of 3`, no alarm, state stays 1 |
-| T5 | Armed: click **VIBRATION** 3 times quickly (< 2 s) | Red LED, beeping buzzer, Field 1 = 2, Field 5 goes up |
+| T5 | Armed: click **VIBRATION** 3 times quickly (< 2 s) | Red LED, beeping buzzer, Field 1 = 2, Field 5 goes up, email sent |
 | T6 | Armed: slide **TILT** to the right | Red LED, continuous tone, Field 1 = 3, Field 4 = 1 |
-| T7 | During a tamper alarm, slide TILT right | `[STATE] TAMPER -> THEFT` |
-| T8 | After an alarm, stop all input (slide TILT back) | Alarm continues until you click BOOT |
+| T7 | During a tamper alarm, slide TILT right | `[STATE] TAMPER -> THEFT`, dashboard alert changes to Theft |
+| T8 | After an alarm, stop all input; click BOOT | Alarm continues; BOOT prints `Already armed. Disarm with the PIN…` |
 | T9 | Trigger two alarms within 10 s | Second upload waits for the 15 s gap, no `entry 0` |
 | T10 | Not possible in Wokwi (Wi-Fi cannot be switched off) | Test on the real hardware |
+| T12 | Dashboard: **Arm** + PIN | `[TALKBACK] command #… received`, then "Locker armed." on the dashboard |
+| T14 | Type `DISARM 0000` five times | `commands locked for 5 min` |
+| T15 / T16 | Trigger theft with the dashboard open | Red banner and siren on the dashboard; email in the owner's inbox |
 
-Each upload prints a `[CLOUD] ... HTTP 200, entry N` line. Open the ThingSpeak channel's **Private View** to watch the charts update.
+The other new tests (T11, T13, T17, T18) are in [`../SETUP.md`](../SETUP.md#6-test-plan).
 
-**Tip:** disarm (BOOT) and slide TILT back to the left before arming again. If TILT is still to the right when the 10 s exit delay ends, the system goes straight to THEFT.
+**Tip:** disarm and slide TILT back to the left before arming again. If TILT is still to the right when the 10 s exit delay ends, the system goes straight to THEFT.
 
 ---
 
 ## 4. Moving back to the real hardware
 
-Use the ready-made hardware sketch in `../arduino/LockerAlarm.ino` (setup steps in `../arduino/README.md`).
+Use the ready-made hardware sketch in `../arduino/LockerAlarm.ino` (setup steps in `../arduino/README.md`), with the same keys and PIN.
 Or, to reuse this sketch, change four lines in `sketch.ino`:
 
 ```cpp
@@ -133,6 +119,7 @@ Also check the tilt module's output level in the Serial Monitor (`[TILT]` lines)
 |---|---|
 | `HTTP 200, entry 0` | Wrong Write API key, or two updates less than 15 s apart |
 | `HTTP -1` / `-11` | Simulator network hiccup. The next upload retries automatically |
+| `[TALKBACK] poll failed, HTTP 401` | Wrong `TB_ID` or `TB_KEY` |
 | Stuck on `Connecting to Wi-Fi....` | SSID must be exactly `Wokwi-GUEST` with an empty password |
 | No sound | Turn on audio in Wokwi (speaker icon), or raise `volume` on the buzzer in diagram.json |
 | One click counts as 2 vibrations | Button bounce. Add `"bounce": "0"` to `btnVib` attrs |
